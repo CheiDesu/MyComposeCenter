@@ -592,6 +592,15 @@ prune_pre_restore() { # $1=原路径
   done <<<"$list"
 }
 
+# 判断某个 compose 项目当前是否存在（还有容器 / 卷 / 网络残留才算存在）
+project_exists() { # $1=项目名
+  local f="label=com.docker.compose.project=$1"
+  [ -n "$(docker ps -aq --filter "$f" 2>/dev/null)" ] && return 0
+  [ -n "$(docker volume ls -q --filter "$f" 2>/dev/null)" ] && return 0
+  [ -n "$(docker network ls -q --filter "$f" 2>/dev/null)" ] && return 0
+  return 1
+}
+
 restore_snapshot() { # $1=id $2=skip_pre(0/1)
   local id="$1" skip_pre="${2:-0}"
   local rec; rec="$(snapshot_record "$id")"
@@ -648,8 +657,10 @@ restore_snapshot() { # $1=id $2=skip_pre(0/1)
 
   # 恢复前快照
   if [ "$skip_pre" = "0" ]; then
-    if ask_yes "恢复前自动打一份当前状态快照？" y; then
-      backup_project "$project" quiesced 0 0 0 || log WARN "恢复前快照失败（继续恢复）"
+    if ! project_exists "$project"; then
+      log INFO "目标项目 $project 当前不存在（新机器 / 已删除），跳过恢复前快照"
+    elif ask_yes "恢复前自动打一份当前状态快照？" y; then
+      backup_project "$project" online 0 0 0 || log WARN "恢复前快照失败（继续恢复）"
     fi
   fi
 
