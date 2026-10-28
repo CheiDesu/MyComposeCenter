@@ -830,18 +830,18 @@ vispad() { # $1=字符串 $2=目标显示宽度
 }
 
 show_snapshots() {
-  local i=0 id project created mode size file status side bind img bindtxt imgtxt
-  printf '%s\n' "${B}$(vispad 编号 4) $(vispad 项目 22) $(vispad 时间 20) $(vispad 模式 6) $(vispad 大小 10) $(vispad bind 8) $(vispad 镜像 8) 文件${C_0}"
+  local i=0 id project created mode size file status side bind img
+  printf '%s\n' "${B}$(vispad 编号 4) $(vispad 项目 22) $(vispad 时间 20) $(vispad 模式 6) $(vispad 大小 10) $(vispad bind 6) $(vispad 镜像 6) 文件${C_0}"
   while IFS=$'\t' read -r id project created mode size file status; do
     [ -z "$id" ] && continue
     i=$((i+1))
     side="${SNAP_DIR}/${file%.tar.*}.manifest.json"
-    bindtxt="无"; imgtxt="无"
+    bind="0"; img="0"
     if [ -f "$side" ]; then
       bind="$(jq -r '[.entries[] | select(.path | startswith("bind/bind-"))] | length' "$side" 2>/dev/null || echo 0)"
       img="$(jq -r '(.images // []) | length' "$side" 2>/dev/null || echo 0)"
-      [ "${bind:-0}" -gt 0 ] 2>/dev/null && bindtxt="有 $bind"
-      [ "${img:-0}" -gt 0 ] 2>/dev/null && imgtxt="有 $img"
+      [ -z "$bind" ] && bind="0"
+      [ -z "$img" ] && img="0"
     fi
     printf '%s %s %s %s %s %s %s %s\n' \
       "$(vispad "$i" 4)" \
@@ -849,8 +849,8 @@ show_snapshots() {
       "$(vispad "$created" 20)" \
       "$(vispad "$([ "$mode" = quiesced ] && echo 静止 || echo 在线)" 6)" \
       "$(vispad "$(human_size "$size")" 10)" \
-      "$(vispad "$bindtxt" 8)" \
-      "$(vispad "$imgtxt" 8)" \
+      "$(vispad "$bind" 6)" \
+      "$(vispad "$img" 6)" \
       "$file"
   done < <(index_list)
   [ "$i" = "0" ] && echo "（还没有任何快照）"
