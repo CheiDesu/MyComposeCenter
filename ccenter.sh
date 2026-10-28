@@ -481,10 +481,16 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
 
   # 7) 镜像本体（可选）
   mkdir -p "$stage/images"
+  local saved_json="[]"
   if [ "$inc_img" = "1" ] && [ -n "$images" ]; then
     log INFO "导出镜像（docker save）…"
-    docker save $images 2>/dev/null | { if [ "$COMPRESS" = "gzip" ]; then gzip -6; else zstd -19 -T0 -q; fi; } \
-      >"$stage/images/images.tar.$([ "$COMPRESS" = "gzip" ] && echo gz || echo zst)"
+    local img_out="$stage/images/images.tar.$([ "$COMPRESS" = "gzip" ] && echo gz || echo zst)"
+    if docker save $images 2>/dev/null | { if [ "$COMPRESS" = "gzip" ]; then gzip -6; else zstd -19 -T0 -q; fi; } >"$img_out"; then
+      saved_json="$(printf '%s\n' $images | jq -R . | jq -s .)"
+    else
+      log WARN "docker save 失败，镜像本体未打包"
+      rm -f "$img_out"
+    fi
   fi
   progress_step "镜像"
 
@@ -504,9 +510,11 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
     --arg docker "$(docker version --format '{{.Server.Version}}' 2>/dev/null)" \
     --arg created "$(date '+%Y-%m-%dT%H:%M:%S%z')" --arg mode "$mode" \
     --arg wd "$wd" --argjson entries "$entries_json" --arg images "$(printf '%s' "$images" | tr '\n' ' ')" \
+    --argjson images_saved "$saved_json" \
     '{schema:($schema|tonumber), tool:$tool, project:$project, host:$host, docker:$docker,
       created:$created, mode:$mode, working_dir:$wd,
-      entries:$entries, images:($images|split(" ")|map(select(length>0)))}' >"$stage/manifest.json"
+      entries:$entries, images:($images|split(" ")|map(select(length>0))),
+      images_saved:$images_saved}' >"$stage/manifest.json"
   progress_step "清单"
 
   # 9) 打包 + 校验 + 原子改名
@@ -839,7 +847,7 @@ show_snapshots() {
     bind="0"; img="0"
     if [ -f "$side" ]; then
       bind="$(jq -r '[.entries[] | select(.path | startswith("bind/bind-"))] | length' "$side" 2>/dev/null || echo 0)"
-      img="$(jq -r '(.images // []) | length' "$side" 2>/dev/null || echo 0)"
+      img="$(jq -r 'if has("images_saved") then (.images_saved | length) elif ([.entries[] | select(.path | startswith("images/"))] | length) > 0 then (.images | length) else 0 end' "$side" 2>/dev/null || echo 0)"
       [ -z "$bind" ] && bind="0"
       [ -z "$img" ] && img="0"
     fi
@@ -969,7 +977,14 @@ print_snapshot_detail() {
     echo "  compose：$(jq -r '[.entries[] | select(.path|startswith("compose/"))] | length' "$sidecar") 个文件"
     echo "  命名卷：$(jq -r '[.entries[] | select(.path|startswith("volumes/"))] | length' "$sidecar") 个"
     echo "  bind 目录：$(jq -r '[.entries[] | select(.path|startswith("bind/bind-"))] | length' "$sidecar") 个"
-    echo "  镜像：$(jq -r '.images | join(", ")' "$sidecar")"
+    local _nsaved _nref
+    _nsaved="$(jq -r '(.images_saved // []) | length' "$sidecar" 2>/dev/null || echo 0)"
+    _nref="$(jq -r '(.images // []) | length' "$sidecar" 2>/dev/null || echo 0)"
+    if [ "${_nsaved:-0}" -gt 0 ] 2>/dev/null; then
+      echo "  镜像：已打包 $_nsaved 个（$(jq -r '.images_saved | join(", ")' "$sidecar")）"
+    else
+      echo "  镜像：仅记录引用 $_nref 个，未打包本体（恢复时依赖本地已有镜像）"
+    fi
   fi
 }
 
