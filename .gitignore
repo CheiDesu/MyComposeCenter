@@ -1,0 +1,5 @@
+snapshots/
+logs/
+*.log
+export/
+config.ini
