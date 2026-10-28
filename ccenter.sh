@@ -25,7 +25,7 @@ AUTO_INTERVAL=12                        # 小时
 MAX_SIZE="10G"
 MIN_KEEP=2
 COMPRESS="zstd"                         # zstd | gzip
-CONSISTENCY="quiesced"                  # quiesced | online | ask
+CONSISTENCY="online"                  # quiesced | online | ask
 INCLUDE_BIND=0
 INCLUDE_IMAGES=0
 AUTO_PROJECTS="all"                     # all | 逗号分隔项目名
@@ -87,6 +87,25 @@ need_docker() {
   [ -n "$DOCKER_ROOT" ] || DOCKER_ROOT="/var/lib/docker"
 }
 
+# 首次运行前检查依赖，缺什么直接说清楚怎么装
+need_tools() {
+  local miss=""
+  local t
+  for t in tar jq flock sha256sum; do
+    command -v "$t" >/dev/null 2>&1 || miss="$miss $t"
+  done
+  case "${COMPRESS:-zstd}" in
+    zstd) command -v zstd >/dev/null 2>&1 || miss="$miss zstd";;
+    gzip) command -v gzip >/dev/null 2>&1 || miss="$miss gzip";;
+    *)    miss="$miss zstd/gzip";;
+  esac
+  if [ -n "$miss" ]; then
+    die "缺少依赖：$miss
+ Debian/Ubuntu: sudo apt install tar jq util-linux zstd
+ CentOS/OpenWrt/NAS: 一般已自带，缺 zstd 可用 apt/opkg 安装，或把 compress 改成 gzip"
+  fi
+}
+
 human_size() {  # bytes -> 人类可读
   local b="${1:-0}"
   awk -v b="$b" 'BEGIN{
@@ -123,6 +142,10 @@ section() { printf '\n%s%s== %s ==%s\n' "$B" "$C_B" "$*" "$C_0"; }
 # =============================================================================
 load_config() {
   init_paths
+  if [ ! -f "$CONFIG_FILE" ]; then
+    save_config
+    log INFO "首次运行：已生成带注释的配置 $CONFIG_FILE（不改也能直接用）"
+  fi
   if [ -f "$CONFIG_FILE" ]; then
     chmod 644 "$CONFIG_FILE" 2>/dev/null || true
     while IFS='=' read -r k v; do
@@ -152,18 +175,47 @@ load_config() {
 save_config() {
   init_paths
   {
-    echo "# ccenter 配置（自动生成，可直接编辑）"
+    echo "# ============================================================================="
+    echo "# ccenter 配置文件（自动生成）。改完保存即可，下次运行时生效。"
+    echo "# 格式：键=值；以 # 开头的是注释，可以整行删除。"
+    echo "# ============================================================================="
+    echo
+    echo "# 备份根目录：快照、日志、索引都放在这里。默认 = 脚本所在目录；也可换成独立磁盘路径。"
     echo "root=$ROOT"
+    echo
+    echo "# 自动备份开关：1=开启，0=关闭（仅影响定时任务，手动备份不受影响）。"
     echo "auto_enabled=$AUTO_ENABLED"
+    echo
+    echo "# 自动备份间隔（小时）。例如 12 = 每 12 小时一次。"
     echo "auto_interval=$AUTO_INTERVAL"
+    echo
+    echo "# 快照总容量上限，支持 K/M/G/T（如 10G）。超过后从最旧的开始删，但至少保留 min_keep 份。"
     echo "max_size=$MAX_SIZE"
+    echo
+    echo "# 至少保留的快照份数（无论容量是否超限）。"
     echo "min_keep=$MIN_KEEP"
+    echo
+    echo "# 压缩方式：zstd（快、体积小，推荐）| gzip（无 zstd 时用）。"
     echo "compress=$COMPRESS"
+    echo
+    echo "# 一致性模式：online=不停容器直接打包（快，但可能抓到写了一半的文件）"
+    echo "#             quiesced=备份前短暂 stop 容器、备份后 start（一致性好，会中断几秒）"
+    echo "#             ask=每次手动备份时询问"
     echo "consistency=$CONSISTENCY"
+    echo
+    echo "# 是否把 bind mount 的本地目录一起打进快照：0=不（推荐，目录请单独备份），1=是。"
     echo "include_bind=$INCLUDE_BIND"
+    echo
+    echo "# 是否用 docker save 把镜像也存进快照：0=不（推荐），1=是（每份多几百 MB~GB）。"
     echo "include_images=$INCLUDE_IMAGES"
+    echo
+    echo "# 自动备份包含哪些项目：all=全部 compose 项目；也可写逗号分隔的项目名（如 blog,db）。"
     echo "auto_projects=$AUTO_PROJECTS"
+    echo
+    echo "# 保留策略：recent=超限时删最旧的；daily=每个项目每天只保留最新一份。"
     echo "retention=$RETENTION"
+    echo
+    echo "# 「校验/导出」的默认导出目录；留空 = <root>/export。"
     echo "export_target=$EXPORT_TARGET"
   } >"$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE" && chmod 644 "$CONFIG_FILE" 2>/dev/null
 }
@@ -1053,6 +1105,7 @@ main() {
   need_root
   load_config
   need_docker
+  need_tools
   index_init
   case "${1:-}" in
     "") load_config; main_menu ;;
