@@ -812,13 +812,46 @@ select_indexes() { # $1=最大编号 -> 输出逗号分隔编号
   echo "$out"
 }
 
+# 按「显示宽度」补齐空格（中文/全角按 2 列算），用于终端表格对齐。
+# 逐字节扫描 UTF-8：首字节 >=0xC0 计 2 列，续字节 0x80-0xBF 忽略。
+vispad() { # $1=字符串 $2=目标显示宽度
+  local s="$1" target="${2:-0}" w=0 i c
+  local LC_ALL=C
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [$'\xc0'-$'\xff']) w=$((w+2)) ;;
+      [$'\x80'-$'\xbf']) ;;
+      *) w=$((w+1)) ;;
+    esac
+  done
+  printf '%s' "$s"
+  while [ "$w" -lt "$target" ]; do printf ' '; w=$((w+1)); done
+}
+
 show_snapshots() {
-  local i=0 id project created mode size file status
-  printf '%s%-4s %-20s %-20s %-6s %-10s %s%s\n' "$B" "编号" "项目" "时间" "模式" "大小" "文件" "$C_0"
+  local i=0 id project created mode size file status side bind img bindtxt imgtxt
+  printf '%s\n' "${B}$(vispad 编号 4) $(vispad 项目 22) $(vispad 时间 20) $(vispad 模式 6) $(vispad 大小 10) $(vispad bind 8) $(vispad 镜像 8) 文件${C_0}"
   while IFS=$'\t' read -r id project created mode size file status; do
     [ -z "$id" ] && continue
     i=$((i+1))
-    printf '%-4s %-20s %-20s %-6s %-10s %s\n' "$i" "${project:0:20}" "$created" "$([ "$mode" = quiesced ] && echo 静止 || echo 在线)" "$(human_size "$size")" "$file"
+    side="${SNAP_DIR}/${file%.tar.*}.manifest.json"
+    bindtxt="无"; imgtxt="无"
+    if [ -f "$side" ]; then
+      bind="$(jq -r '[.entries[] | select(.path | startswith("bind/bind-"))] | length' "$side" 2>/dev/null || echo 0)"
+      img="$(jq -r '(.images // []) | length' "$side" 2>/dev/null || echo 0)"
+      [ "${bind:-0}" -gt 0 ] 2>/dev/null && bindtxt="有 $bind"
+      [ "${img:-0}" -gt 0 ] 2>/dev/null && imgtxt="有 $img"
+    fi
+    printf '%s %s %s %s %s %s %s %s\n' \
+      "$(vispad "$i" 4)" \
+      "$(vispad "${project:0:20}" 22)" \
+      "$(vispad "$created" 20)" \
+      "$(vispad "$([ "$mode" = quiesced ] && echo 静止 || echo 在线)" 6)" \
+      "$(vispad "$(human_size "$size")" 10)" \
+      "$(vispad "$bindtxt" 8)" \
+      "$(vispad "$imgtxt" 8)" \
+      "$file"
   done < <(index_list)
   [ "$i" = "0" ] && echo "（还没有任何快照）"
 }
@@ -929,11 +962,13 @@ print_snapshot_detail() {
   local file; file="$(jq -r '.file' <<<"$rec")"
   local sidecar="${SNAP_DIR}/${file%.tar.*}.manifest.json"
   section "快照详情"
-  jq -r '"  项目：\(.project)\n  时间：\(.created)\n  模式：\(if .mode=="quiesced" then "静止" else "在线" end)\n  大小：\(.size)\n  文件：\(.file)\n  sha256：\(.sha256)"' <<<"$rec"
+  local _sz; _sz="$(human_size "$(jq -r '.size' <<<"$rec")")"
+  jq -r '"  项目：\(.project)\n  时间：\(.created)\n  模式：\(if .mode=="quiesced" then "静止" else "在线" end)\n  文件：\(.file)\n  sha256：\(.sha256)"' <<<"$rec"
+  echo "  大小：$_sz"
   if [ -f "$sidecar" ]; then
-    echo "  compose：$(ls -1 "$SNAP_DIR" >/dev/null 2>&1; jq -r '[.entries[] | select(.path|startswith("compose/"))] | length' "$sidecar") 个文件"
+    echo "  compose：$(jq -r '[.entries[] | select(.path|startswith("compose/"))] | length' "$sidecar") 个文件"
     echo "  命名卷：$(jq -r '[.entries[] | select(.path|startswith("volumes/"))] | length' "$sidecar") 个"
-    echo "  bind 目录：$(jq -r '[.entries[] | select(.path|startswith("bind/"))] | length' "$sidecar") 个"
+    echo "  bind 目录：$(jq -r '[.entries[] | select(.path|startswith("bind/bind-"))] | length' "$sidecar") 个"
     echo "  镜像：$(jq -r '.images | join(", ")' "$sidecar")"
   fi
 }
@@ -1141,7 +1176,7 @@ cli_main() {
     projects)
       discover_projects ;;
     list)
-      index_list | awk -F'\t' '{printf "%-22s %-20s %-6s %s\n",$2,$3,$4,$6}' ;;
+      init_paths; show_snapshots ;;
     status)
       if [ "${1:-}" = "--json" ]; then
         jq -n --arg root "$ROOT" --argjson usage "$(total_usage)" --arg max "$MAX_SIZE" \
