@@ -7,7 +7,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
@@ -18,6 +18,24 @@ else
   C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_0=""; B=""
 fi
 
+# ---------- 进度显示 ----------
+PB_ON=0; PB_TOTAL=1; PB_CUR=0
+list_has() { # $1=逗号分隔列表 $2=值
+  local IFS=',' x; for x in $1; do [ "$x" = "$2" ] && return 0; done; return 1
+}
+progress_begin() { PB_ON=1; PB_CUR=0; PB_TOTAL="${1:-1}"; [ "$PB_TOTAL" -lt 1 ] && PB_TOTAL=1; progress_render "${2:-}"; }
+progress_render() { # $1=当前说明
+  [ "$PB_ON" = "1" ] || return 0
+  local pct=$(( PB_CUR * 100 / PB_TOTAL )) width=20 fill k bar=""
+  [ "$pct" -gt 100 ] && pct=100
+  fill=$(( pct * width / 100 ))
+  for ((k=0;k<width;k++)); do if [ "$k" -lt "$fill" ]; then bar+="█"; else bar+="░"; fi; done
+  if [ -t 2 ]; then printf '\r  %s[%s] %3d%%%s  %s\033[K' "$C_B" "$bar" "$pct" "$C_0" "${1:-}" >&2
+  else printf '  [%d/%d] %s\n' "$PB_CUR" "$PB_TOTAL" "${1:-}" >&2; fi
+}
+progress_step() { PB_CUR=$((PB_CUR+1)); progress_render "${1:-}"; }
+progress_end() { if [ "$PB_ON" = "1" ]; then PB_ON=0; [ -t 2 ] && printf '\r\033[K' >&2; fi; }
+
 # ---------- 默认配置 ----------
 ROOT="${CCENTER_ROOT:-$SCRIPT_DIR}"     # 备份根目录：默认脚本所在文件夹
 AUTO_ENABLED=1
@@ -27,6 +45,7 @@ MIN_KEEP=2
 COMPRESS="zstd"                         # zstd | gzip
 CONSISTENCY="online"                  # quiesced | online | ask
 INCLUDE_BIND=0
+BIND_PROJECTS="dsh-compose"             # 自动备份时即使 include_bind=0 也强制打包 bind 的项目（逗号分隔）
 INCLUDE_IMAGES=0
 AUTO_PROJECTS="all"                     # all | 逗号分隔项目名
 RETENTION="recent"                      # recent | daily
@@ -161,12 +180,17 @@ load_config() {
         compress) COMPRESS="$v";;
         consistency) CONSISTENCY="$v";;
         include_bind) INCLUDE_BIND="$v";;
+        bind_projects) BIND_PROJECTS="$v";;
         include_images) INCLUDE_IMAGES="$v";;
         auto_projects) AUTO_PROJECTS="$v";;
         retention) RETENTION="$v";;
         export_target) EXPORT_TARGET="$v";;
       esac
     done <"$CONFIG_FILE"
+    # 老配置文件缺少新键时自动补一行（不动用户已有值）
+    if ! grep -q '^[[:space:]]*bind_projects=' "$CONFIG_FILE" 2>/dev/null; then
+      printf '\n# 自动备份时，即使 include_bind=0，也强制打包 bind 的项目（逗号分隔，如 dsh-compose）。\nbind_projects=%s\n' "$BIND_PROJECTS" >>"$CONFIG_FILE"
+    fi
   fi
   init_paths
   export CCENTER_ROOT="$ROOT"
@@ -203,8 +227,11 @@ save_config() {
     echo "#             ask=每次手动备份时询问"
     echo "consistency=$CONSISTENCY"
     echo
-    echo "# 是否把 bind mount 的本地目录一起打进快照：0=不（推荐，目录请单独备份），1=是。"
+    echo "# 是否把 bind mount 的本地目录一起打进快照：0=不（默认），1=是（整机还原必需，例如 DSH 的会话历史在 bind 目录里）。"
     echo "include_bind=$INCLUDE_BIND"
+    echo
+    echo "# 自动备份时，即使 include_bind=0，也强制把 bind 目录打包的项目（逗号分隔，如 dsh-compose）。"
+    echo "bind_projects=$BIND_PROJECTS"
     echo
     echo "# 是否用 docker save 把镜像也存进快照：0=不（推荐），1=是（每份多几百 MB~GB）。"
     echo "include_images=$INCLUDE_IMAGES"
@@ -376,6 +403,28 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
   done <<<"$files"
   log OK "已收集 compose 文件 ${#file_arr[@]} 个（工作目录：$wd）"
 
+  # 自动备份：命中 bind_projects 的项目强制打包 bind（保证整机可还原，如 DSH 的会话历史在 bind 目录）
+  if [ "$auto" = "1" ] && list_has "$BIND_PROJECTS" "$name"; then inc_bind=1; fi
+
+  # 预先枚举卷与 bind 挂载（用于进度条）
+  local _vols; _vols="$(docker volume ls --filter "label=com.docker.compose.project=$name" --format '{{.Name}}' 2>/dev/null)"
+  if [ -z "$_vols" ]; then
+    _vols="$(docker compose -p "$name" -f "$(echo "$files" | head -1)" config --format json 2>/dev/null | jq -r '.volumes // {} | keys[]' 2>/dev/null)"
+  fi
+  local _mounts=""
+  if [ "$inc_bind" = "1" ]; then
+    _mounts="$(for c in $(project_containers "$name"); do
+        docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$c" 2>/dev/null
+      done | sort -u)"
+  fi
+  local _nvol=0 _nb=0 _x
+  for _x in $_vols; do [ -d "$(volume_path "$_x")" ] && _nvol=$((_nvol+1)); done
+  while IFS= read -r _x; do
+    case "$_x" in ""|/dev*|/proc*|/sys*|/run*|/tmp*) continue ;; esac
+    [ -d "$_x" ] && _nb=$((_nb+1))
+  done <<<"$_mounts"
+  progress_begin $(( 4 + _nvol + _nb )) "备份 $name"
+
   # 2) 一致性：静止模式先停
   if [ "$mode" = "quiesced" ]; then
     log INFO "静止模式：停止项目容器…"
@@ -389,6 +438,7 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
   for c in $(project_containers "$name"); do
     docker inspect "$c" >"$stage/meta/inspect-$c.json" 2>/dev/null || true
   done
+  progress_step "容器元数据"
 
   # 4) 镜像清单
   local images=""
@@ -397,11 +447,7 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
 
   # 5) 命名卷
   mkdir -p "$stage/volumes"
-  local vols; vols="$(docker volume ls --filter "label=com.docker.compose.project=$name" --format '{{.Name}}' 2>/dev/null)"
-  # 兜底：compose config 里声明的卷
-  if [ -z "$vols" ]; then
-    vols="$(docker compose -p "$name" -f "$(echo "$files" | head -1)" config --format json 2>/dev/null | jq -r '.volumes // {} | keys[]' 2>/dev/null)"
-  fi
+  local vols="$_vols"
   local v vcount=0
   for v in $vols; do
     local vp; vp="$(volume_path "$v")"
@@ -409,6 +455,7 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
     log INFO "打包卷 $v …"
     tar_to_zst "$vp" "$stage/volumes/$v.tar.$([ "$COMPRESS" = "gzip" ] && echo gz || echo zst)"
     vcount=$((vcount+1))
+    progress_step "卷 $v"
   done
   log OK "已打包命名卷 $vcount 个"
 
@@ -416,10 +463,7 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
   mkdir -p "$stage/bind"
   local bind_count=0
   if [ "$inc_bind" = "1" ]; then
-    local mounts
-    mounts="$(for c in $(project_containers "$name"); do
-        docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$c" 2>/dev/null
-      done | sort -u)"
+    local mounts="$_mounts"
     local m idx=0
     for m in $mounts; do
       case "$m" in /dev*|/proc*|/sys*|/run*|/tmp*) continue ;; esac
@@ -431,6 +475,7 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
         | { if [ "$COMPRESS" = "gzip" ]; then gzip -6; else zstd -19 -T0 -q; fi; } >"$stage/bind/bind-$idx-$bn.tar.$([ "$COMPRESS" = "gzip" ] && echo gz || echo zst)"
       printf '%s\n' "$m" >>"$stage/bind/paths.txt"
       bind_count=$((bind_count+1))
+      progress_step "bind $(basename "$m")"
     done
   fi
 
@@ -441,6 +486,7 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
     docker save $images 2>/dev/null | { if [ "$COMPRESS" = "gzip" ]; then gzip -6; else zstd -19 -T0 -q; fi; } \
       >"$stage/images/images.tar.$([ "$COMPRESS" = "gzip" ] && echo gz || echo zst)"
   fi
+  progress_step "镜像"
 
   # 8) manifest
   local entries_json="[]"
@@ -461,9 +507,11 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
     '{schema:($schema|tonumber), tool:$tool, project:$project, host:$host, docker:$docker,
       created:$created, mode:$mode, working_dir:$wd,
       entries:$entries, images:($images|split(" ")|map(select(length>0)))}' >"$stage/manifest.json"
+  progress_step "清单"
 
   # 9) 打包 + 校验 + 原子改名
   log INFO "生成快照包（$COMPRESS）…"
+  progress_step "打包快照"
   if [ "$COMPRESS" = "gzip" ]; then
     tar --xattrs --acls --numeric-owner -C "$stage" -cf - . 2>/dev/null | gzip -6 >"$tarfile.part"
   else
@@ -492,6 +540,7 @@ backup_project() { # $1=project $2=mode(online|quiesced) $3=include_bind(0/1) $4
   index_add "$rec"
   rm -rf "$stage"
   log OK "备份完成：$(basename "$tarfile")（$(human_size "$size")，耗时 $((finished-started)) 秒）"
+  progress_end
 
   if [ "$auto" = "1" ]; then echo "$(date '+%F %T') 自动备份 $name -> $(basename "$tarfile") $(human_size "$size")" >>"$LOG_DIR/auto.log"; fi
 }
@@ -525,6 +574,16 @@ prune_snapshots() {
 # =============================================================================
 # 恢复
 # =============================================================================
+# 只保留最近一份 .pre-restore 备份，避免每次恢复都堆一份
+prune_pre_restore() { # $1=原路径
+  local n=0 x list
+  list="$(ls -1dt "$1".pre-restore.* 2>/dev/null || true)"
+  [ -z "$list" ] && return 0
+  while IFS= read -r x; do
+    n=$((n+1)); [ "$n" -gt 1 ] && rm -rf "$x"
+  done <<<"$list"
+}
+
 restore_snapshot() { # $1=id $2=skip_pre(0/1)
   local id="$1" skip_pre="${2:-0}"
   local rec; rec="$(snapshot_record "$id")"
@@ -557,6 +616,17 @@ restore_snapshot() { # $1=id $2=skip_pre(0/1)
   local manifest="$work/manifest.json"
   [ -f "$manifest" ] || { log ERROR "快照里没有 manifest.json"; return 1; }
 
+  # 进度条：统计要做的活
+  local _nv; _nv="$(ls -1 "$work"/volumes/*.tar.* 2>/dev/null | wc -l)"
+  local _nb=0
+  [ -f "$work/bind/paths.txt" ] && _nb="$(wc -l <"$work/bind/paths.txt" | tr -d ' ')"
+  local _nimgs=0
+  ls -1 "$work"/images/*.tar.* >/dev/null 2>&1 && _nimgs=1
+  progress_begin $(( 4 + _nv + _nb + _nimgs )) "恢复 $project"
+  if [ ! -f "$work/bind/paths.txt" ]; then
+    log WARN "该快照不含 bind 目录：若项目有 bind 挂载（如 DSH 的 /root/.dsh 会话历史），恢复后这些内容不会被还原。"
+  fi
+
   # 逐条校验
   local bad=0
   while IFS=$'\t' read -r rel esha; do
@@ -566,6 +636,7 @@ restore_snapshot() { # $1=id $2=skip_pre(0/1)
   done < <(jq -r '.entries[] | [.path,.sha256] | @tsv' "$manifest")
   [ "$bad" = "1" ] && { log ERROR "条目校验未通过，中止恢复"; return 1; }
   log OK "全部条目校验通过"
+  progress_step "条目校验"
 
   # 恢复前快照
   if [ "$skip_pre" = "0" ]; then
@@ -594,7 +665,9 @@ restore_snapshot() { # $1=id $2=skip_pre(0/1)
     mkdir -p "$wd"
     cp -a "$cf" "$target"
     log OK "已还原 $target"
+    prune_pre_restore "$target"
   done
+  progress_step "compose 文件"
 
   # 用还原后的真实路径启动（避免容器 label 指向临时目录）
   local restored_main="$wd/$(basename "$mainfile")"
@@ -615,6 +688,7 @@ restore_snapshot() { # $1=id $2=skip_pre(0/1)
     if [[ "$vf" == *.zst ]]; then zstd -dcq "$vf" | tar --xattrs --acls --numeric-owner -xpf - -C "$target" 2>/dev/null
     else gzip -dc "$vf" | tar --xattrs --acls --numeric-owner -xpf - -C "$target" 2>/dev/null; fi
     log OK "卷 $vname 已还原"
+    progress_step "卷 $vname"
   done
 
   # 还原 bind
@@ -631,12 +705,26 @@ restore_snapshot() { # $1=id $2=skip_pre(0/1)
       if [[ "$bf" == *.zst ]]; then zstd -dcq "$bf" | tar --xattrs --acls --numeric-owner -xpf - -C "$parent" 2>/dev/null
       else gzip -dc "$bf" | tar --xattrs --acls --numeric-owner -xpf - -C "$parent" 2>/dev/null; fi
       log OK "已还原 bind 目录 $path"
+      prune_pre_restore "$path"
+      progress_step "bind $(basename "$path")"
     done <"$work/bind/paths.txt"
+  fi
+
+  # 镜像（如果快照里带了）
+  if [ -f "$work"/images/images.tar.* ]; then
+    local imf; imf="$(ls "$work"/images/images.tar.* 2>/dev/null | head -1)"
+    if [ -n "$imf" ]; then
+      log INFO "导入镜像…"
+      if [[ "$imf" == *.zst ]]; then zstd -dcq "$imf" | docker load >>"$LOG_FILE" 2>&1 || log WARN "docker load 失败"
+      else gzip -dc "$imf" | docker load >>"$LOG_FILE" 2>&1 || log WARN "docker load 失败"; fi
+      progress_step "镜像"
+    fi
   fi
 
   # 启动
   log INFO "启动项目容器…"
   docker compose -p "$project" -f "$mainfile" up -d --remove-orphans --force-recreate >>"$LOG_FILE" 2>&1 || log WARN "up -d 返回非零"
+  progress_step "启动容器"
 
   # 健康检查
   local waited=0 ok=0
@@ -648,6 +736,8 @@ restore_snapshot() { # $1=id $2=skip_pre(0/1)
     sleep 2; waited=$((waited+2))
   done
   if [ "$ok" = "1" ]; then log OK "恢复完成：$project（健康检查通过，用时 ${waited}s）"; else log WARN "容器已启动但健康检查超时（${waited}s），请手动确认"; fi
+  progress_step "健康检查"
+  progress_end
 
   echo "$(date '+%F %T') restore $project from $id" >>"$LOG_DIR/restore.log"
   rm -rf "$work"
@@ -830,18 +920,22 @@ menu_list() {
 }
 
 show_snapshot_detail() {
+  print_snapshot_detail "$1"
+  printf '\n按回车返回…'; read -r _ || true
+}
+
+print_snapshot_detail() {
   local rec; rec="$(snapshot_record "$1")"
-  local side="$SNAP_DIR/%s.manifest.json"
   local file; file="$(jq -r '.file' <<<"$rec")"
   local sidecar="${SNAP_DIR}/${file%.tar.*}.manifest.json"
   section "快照详情"
   jq -r '"  项目：\(.project)\n  时间：\(.created)\n  模式：\(if .mode=="quiesced" then "静止" else "在线" end)\n  大小：\(.size)\n  文件：\(.file)\n  sha256：\(.sha256)"' <<<"$rec"
   if [ -f "$sidecar" ]; then
-    echo "  内容："
-    jq -r '.entries[] | "    - \(.path)  \(.size) B"' "$sidecar" | head -20
+    echo "  compose：$(ls -1 "$SNAP_DIR" >/dev/null 2>&1; jq -r '[.entries[] | select(.path|startswith("compose/"))] | length' "$sidecar") 个文件"
+    echo "  命名卷：$(jq -r '[.entries[] | select(.path|startswith("volumes/"))] | length' "$sidecar") 个"
+    echo "  bind 目录：$(jq -r '[.entries[] | select(.path|startswith("bind/"))] | length' "$sidecar") 个"
     echo "  镜像：$(jq -r '.images | join(", ")' "$sidecar")"
   fi
-  printf '\n按回车返回…'; read -r _ || true
 }
 
 do_delete() {
@@ -876,7 +970,7 @@ menu_restore() {
   printf '\n选择要恢复的编号：'; local n; read -r n || return
   local id="$(snap_id_by_index "$n")"
   [ -z "$id" ] && { echo "无效编号"; sleep 1; return; }
-  show_snapshot_detail "$id" >/dev/null
+  print_snapshot_detail "$id"
 
   # 自己恢复自己：提示并后台执行
   local project; project="$(snapshot_record "$id" | jq -r '.project')"
@@ -890,7 +984,9 @@ menu_restore() {
   fi
 
   printf '\n即将恢复：%s\n' "$project"
-  ask_yes "确认继续？" n || { echo "已取消"; return; }
+  printf '  将还原：compose 文件、命名卷、bind 目录（以快照内实际内容为准）\n'
+  printf '  输入 y 后回车 = 确认恢复；直接回车 = 取消。\n'
+  ask_yes "确认恢复？" n || { echo "已取消（未做任何修改）"; return; }
   restore_snapshot "$id" 0
   printf '\n按回车返回…'; read -r _ || true
 }
@@ -1093,7 +1189,12 @@ cli_main() {
     config)
       if [ "${1:-}" = "--json" ]; then
         jq -n --arg root "$ROOT" --arg auto "$AUTO_ENABLED" --arg iv "$AUTO_INTERVAL" --arg max "$MAX_SIZE" \
-          '{root:$root, auto_enabled:$auto, interval_h:$iv, max_size:$max}'
+          --arg mk "$MIN_KEEP" --arg cmp "$COMPRESS" --arg con "$CONSISTENCY" --arg ib "$INCLUDE_BIND" \
+          --arg bp "$BIND_PROJECTS" --arg ii "$INCLUDE_IMAGES" --arg ap "$AUTO_PROJECTS" \
+          --arg ret "$RETENTION" --arg et "$EXPORT_TARGET" \
+          '{root:$root, auto_enabled:$auto, auto_interval:$iv, max_size:$max, min_keep:$mk,
+            compress:$cmp, consistency:$con, include_bind:$ib, bind_projects:$bp,
+            include_images:$ii, auto_projects:$ap, retention:$ret, export_target:$et}'
       else cat "$CONFIG_FILE" 2>/dev/null; fi ;;
     "") main_menu ;;
     *) cli_usage; exit 1 ;;

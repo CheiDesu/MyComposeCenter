@@ -24,10 +24,14 @@ compress=zstd
 # 一致性模式：online=不停容器直接打包（快，但可能抓到写了一半的文件）
 #             quiesced=备份前短暂 stop 容器、备份后 start（一致性好，会中断几秒）
 #             ask=每次手动备份时询问
-consistency=quiesced
+consistency=online
 
-# 是否把 bind mount 的本地目录一起打进快照：0=不（推荐，目录请单独备份），1=是。
+# 是否把 bind mount 的本地目录一起打进快照：0=不（默认），1=是（整机还原必需，例如 DSH 的会话在 bind 目录里）。
 include_bind=0
+
+# 自动备份时，即使 include_bind=0，也强制打包 bind 的项目（逗号分隔，如 dsh-compose）。
+# 想让自动备份连会话历史一起备份，就把对应项目名填在这里；不需要就留空。
+bind_projects=dsh-compose
 
 # 是否用 docker save 把镜像也存进快照：0=不（推荐），1=是（每份多几百 MB~GB）。
 include_images=0
