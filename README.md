@@ -108,7 +108,8 @@ ccenter timer uninstall
 | `max_size` | `10G` | 快照总容量上限，支持 `K/M/G/T`；超过后从最旧开始删。 |
 | `min_keep` | `2` | 无论容量是否超限，至少保留几份。 |
 | `compress` | `zstd` | 压缩方式：`zstd`（推荐）或 `gzip`（没有 zstd 时用）。 |
-| `consistency` | `online` | `online` 不停容器（快）；`quiesced` 备份前短暂停容器（一致性好，会中断几秒）；`ask` 每次询问。 |
+| `consistency` | `online` | **手动备份**的一致性：`online` 不停容器（快）；`quiesced` 备份前短暂停容器（一致性好，会中断几秒）；`ask` 每次询问。 |
+| `auto_quiesce` | `0` | **自动备份**是否先停容器：`0` 在线备份、不停容器（默认，服务不中断）；`1` 先 stop 再 start（一致性好，但会中断几秒）。 |
 | `include_bind` | `0` | 是否把 bind mount 的本地目录也打进快照：`0` 不（默认），`1` 是（整机还原必需，例如 DSH 的会话在 bind 目录里）。 |
 | `bind_projects` | `dsh-compose` | 自动备份时，即使 `include_bind=0`，也强制打包这些项目的 bind（逗号分隔）。想让自动备份包含会话历史就填项目名；不需要就留空。 |
 | `include_images` | `0` | 是否用 `docker save` 把镜像也存进快照：`0` 不，`1` 是（每份多几百 MB~GB）。 |

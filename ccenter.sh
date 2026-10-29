@@ -48,6 +48,7 @@ INCLUDE_BIND=0
 BIND_PROJECTS="dsh-compose"             # 自动备份时即使 include_bind=0 也强制打包 bind 的项目（逗号分隔）
 INCLUDE_IMAGES=0
 AUTO_PROJECTS="all"                     # all | 逗号分隔项目名
+AUTO_QUIESCE=0                          # 自动备份是否先停容器：0=在线备份（不中断服务），1=短暂 stop
 RETENTION="recent"                      # recent | daily
 EXPORT_TARGET=""
 
@@ -183,6 +184,7 @@ load_config() {
         bind_projects) BIND_PROJECTS="$v";;
         include_images) INCLUDE_IMAGES="$v";;
         auto_projects) AUTO_PROJECTS="$v";;
+        auto_quiesce) AUTO_QUIESCE="$v";;
         retention) RETENTION="$v";;
         export_target) EXPORT_TARGET="$v";;
       esac
@@ -238,6 +240,10 @@ save_config() {
     echo
     echo "# 自动备份包含哪些项目：all=全部 compose 项目；也可写逗号分隔的项目名（如 blog,db）。"
     echo "auto_projects=$AUTO_PROJECTS"
+    echo
+    echo "# 自动备份时是否短暂停止容器：0=不停止（在线备份，服务不中断，默认）"
+    echo "#                             1=先 stop 再 start（一致性好，但会中断几秒）"
+    echo "auto_quiesce=$AUTO_QUIESCE"
     echo
     echo "# 保留策略：recent=超限时删最旧的；daily=每个项目每天只保留最新一份。"
     echo "retention=$RETENTION"
@@ -1061,7 +1067,7 @@ menu_config() {
     printf '  [4] 备份总容量上限        %s\n' "$MAX_SIZE"
     printf '  [5] 保留份数下限          %s\n' "$MIN_KEEP"
     printf '  [6] 压缩方式              %s\n' "$COMPRESS"
-    printf '  [7] 一致性默认模式        %s\n' "$CONSISTENCY"
+    printf '  [7] 手动备份一致性模式    %s\n' "$CONSISTENCY"
     printf '  [8] 自动备份包含 bind     %s\n' "$([ "$INCLUDE_BIND" = "1" ] && echo 是 || echo 否)"
     printf '  [9] 自动备份镜像          %s\n' "$([ "$INCLUDE_IMAGES" = "1" ] && echo 是 || echo 否)"
     printf '  [10] 自动备份项目范围     %s\n' "$AUTO_PROJECTS"
@@ -1069,6 +1075,7 @@ menu_config() {
     printf '  [12] 导出目标（异地）     %s\n' "${EXPORT_TARGET:-无}"
     printf '  [13] 安装自动备份定时器   %s\n' "$([ -f /etc/systemd/system/ccenter-backup.timer ] && echo 已安装 || echo 未安装)"
     printf '  [14] 卸载自动备份定时器\n'
+    printf '  [15] 自动备份暂停容器     %s\n' "$([ "$AUTO_QUIESCE" = "1" ] && echo 是（会中断几秒）|| echo 否（推荐，不停容器）)"
     printf '  [0] 返回\n\n选择：'
     local c; read -r c || return
     case "$c" in
@@ -1087,6 +1094,7 @@ menu_config() {
       12) printf '导出目标路径（空=无）：'; read -r v; EXPORT_TARGET="$v" ;;
       13) install_timer ;;
       14) uninstall_timer ;;
+      15) [ "$AUTO_QUIESCE" = "1" ] && AUTO_QUIESCE=0 || AUTO_QUIESCE=1 ;;
     esac
     save_config
   done
@@ -1133,7 +1141,8 @@ menu_verify() {
 run_auto_backup() {
   log INFO "=== 自动备份开始 ==="
   local mode="online"
-  case "$CONSISTENCY" in quiesced) mode="quiesced" ;; online) mode="online" ;; ask) mode="online" ;; esac
+  [ "$AUTO_QUIESCE" = "1" ] && mode="quiesced"
+  log INFO "自动备份模式：$([ "$mode" = "quiesced" ] && echo 静止（会短暂停止容器）|| echo 在线（不停止容器，服务不中断）)"
   local names=""
   if [ "$AUTO_PROJECTS" = "all" ]; then
     names="$(discover_projects | cut -f1)"
@@ -1252,10 +1261,10 @@ cli_main() {
         jq -n --arg root "$ROOT" --arg auto "$AUTO_ENABLED" --arg iv "$AUTO_INTERVAL" --arg max "$MAX_SIZE" \
           --arg mk "$MIN_KEEP" --arg cmp "$COMPRESS" --arg con "$CONSISTENCY" --arg ib "$INCLUDE_BIND" \
           --arg bp "$BIND_PROJECTS" --arg ii "$INCLUDE_IMAGES" --arg ap "$AUTO_PROJECTS" \
-          --arg ret "$RETENTION" --arg et "$EXPORT_TARGET" \
+          --arg ret "$RETENTION" --arg et "$EXPORT_TARGET" --arg aq "$AUTO_QUIESCE" \
           '{root:$root, auto_enabled:$auto, auto_interval:$iv, max_size:$max, min_keep:$mk,
             compress:$cmp, consistency:$con, include_bind:$ib, bind_projects:$bp,
-            include_images:$ii, auto_projects:$ap, retention:$ret, export_target:$et}'
+            include_images:$ii, auto_projects:$ap, retention:$ret, export_target:$et, auto_quiesce:$aq}'
       else cat "$CONFIG_FILE" 2>/dev/null; fi ;;
     "") main_menu ;;
     *) cli_usage; exit 1 ;;

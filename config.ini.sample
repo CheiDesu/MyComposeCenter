@@ -39,6 +39,10 @@ include_images=0
 # 自动备份包含哪些项目：all=全部 compose 项目；也可写逗号分隔的项目名（如 blog,db）。
 auto_projects=all
 
+# 自动备份时是否短暂停止容器：0=不停止（在线备份，服务不中断，推荐）
+#                             1=先 stop 再 start（一致性好，但会中断几秒）
+auto_quiesce=0
+
 # 保留策略：recent=超限时删最旧的；daily=每个项目每天只保留最新一份。
 retention=recent
 
