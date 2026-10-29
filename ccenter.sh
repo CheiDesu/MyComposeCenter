@@ -7,7 +7,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
@@ -854,12 +854,24 @@ vispad() { # $1=字符串 $2=目标显示宽度
   while [ "$w" -lt "$target" ]; do printf ' '; w=$((w+1)); done
 }
 
-show_snapshots() {
+show_snapshots() { # $1=页码(默认1) $2=每页条数(默认0=全部)
+  local page="${1:-1}" per="${2:-0}"
+  local total; total="$(snap_count)"
+  local pages=1 start=1 end="$total" p="$page"
+  if [ "${per:-0}" -gt 0 ] 2>/dev/null && [ "$total" -gt "$per" ]; then
+    pages=$(( (total + per - 1) / per ))
+    [ "$p" -lt 1 ] && p=1
+    [ "$p" -gt "$pages" ] && p="$pages"
+    start=$(( (p - 1) * per + 1 )); end=$(( p * per ))
+    [ "$end" -gt "$total" ] && end="$total"
+  fi
   local i=0 id project created mode size file status side bind img
   printf '%s\n' "${B}$(vispad 编号 4) $(vispad 项目 22) $(vispad 时间 20) $(vispad 模式 6) $(vispad 大小 10) $(vispad bind 6) $(vispad 镜像 6) 文件${C_0}"
   while IFS=$'\t' read -r id project created mode size file status; do
     [ -z "$id" ] && continue
     i=$((i+1))
+    [ "$i" -lt "$start" ] && continue
+    [ "$i" -gt "$end" ] && break
     side="${SNAP_DIR}/${file%.tar.*}.manifest.json"
     bind="0"; img="0"
     if [ -f "$side" ]; then
@@ -878,7 +890,12 @@ show_snapshots() {
       "$(vispad "$img" 6)" \
       "$file"
   done < <(index_list)
-  [ "$i" = "0" ] && echo "（还没有任何快照）"
+  if [ "$i" = "0" ]; then echo "（还没有任何快照）"; return; fi
+  if [ "${per:-0}" -gt 0 ] 2>/dev/null && [ "$total" -gt "$per" ]; then
+    printf '%s\n' "  ── 共 ${total} 条，第 ${p}/${pages} 页（每页 ${per} 条）──"
+  else
+    printf '%s\n' "  ── 共 ${total} 条 ──"
+  fi
 }
 
 # =============================================================================
@@ -956,21 +973,29 @@ menu_backup() {
 }
 
 menu_list() {
+  local page=1
   while true; do
     clear 2>/dev/null || true; section "查看 / 删除备份"
-    show_snapshots
-    printf '\n输入编号看详情 / 删除；%sd%s 编号 删除；%sq%s 返回\n' "$C_B" "$C_0" "$C_B" "$C_0"
-    printf '选择：'; local c; read -r c || return
+    local total; total="$(snap_count)"
+    local per=10 pages=1
+    if [ "$total" -gt "$per" ]; then pages=$(( (total + per - 1) / per )); fi
+    [ "$page" -lt 1 ] && page=1
+    [ "$page" -gt "$pages" ] && page="$pages"
+    show_snapshots "$page" "$per"
+    printf '\n输入编号看详情；%sd <编号|范围>%s 删除（如 d 1-5、d 2,4）；%sn%s 下一页；%sp%s 上一页；%sq%s 返回\n' "$C_B" "$C_0" "$C_B" "$C_0" "$C_B" "$C_0" "$C_B" "$C_0"
+    printf '第 %s/%s 页，选择：' "$page" "$pages"
+    local c; read -r c || return
     case "$c" in
       q|Q) return ;;
+      n|N) [ "$page" -lt "$pages" ] && page=$((page + 1)) ;;
+      p|P) [ "$page" -gt 1 ] && page=$((page - 1)) ;;
       d|D)
-        printf '要删除的编号：'; local s; read -r s || continue
-        local n; n="$(echo "$s" | tr -d ' ')"
-        local idx="$(snap_id_by_index "$n")"
-        [ -z "$idx" ] && { echo "无效编号"; sleep 1; continue; }
-        do_delete "$idx" ;;
+        printf '要删除的编号（支持 1-5、2,4,7-9）：'; local s; read -r s || continue
+        do_delete_batch "$s" "$total" ;;
+      d\ *|D\ *)
+        do_delete_batch "${c#* }" "$total" ;;
       *)
-        local nidx="$(snap_id_by_index "$c")"
+        local nidx; nidx="$(snap_id_by_index "$(echo "$c" | tr -d ' ')")"
         [ -z "$nidx" ] && { echo "无效编号"; sleep 1; continue; }
         show_snapshot_detail "$nidx" ;;
     esac
@@ -1003,6 +1028,72 @@ print_snapshot_detail() {
       echo "  镜像：仅记录引用 $_nref 个，未打包本体（恢复时依赖本地已有镜像）"
     fi
   fi
+}
+
+expand_indexes() { # $1=表达式(1-5 / 2,4,7-9) $2=最大编号 -> 升序去重编号
+  local expr="$1" max="$2" part a b i
+  local -a raw=()
+  local IFS=','
+  local -a parts=($expr)
+  IFS=$' \t\n'
+  for part in "${parts[@]:-}"; do
+    part="$(echo "$part" | tr -d ' ')"
+    [ -z "$part" ] && continue
+    if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+      [ "$a" -gt "$b" ] && { local t="$a"; a="$b"; b="$t"; }
+      for ((i=a; i<=b; i++)); do raw+=("$i"); done
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      raw+=("$((10#$part))")
+    fi
+  done
+  [ "${#raw[@]}" -eq 0 ] && return 0
+  printf '%s\n' "${raw[@]}" | awk -v m="$max" '$1>=1 && $1<=m' | sort -n -u | tr '\n' ' '
+}
+
+do_delete_batch() { # $1=编号表达式 $2=最大编号
+  local expr="$1" max="${2:-0}"
+  local list; list="$(expand_indexes "$expr" "$max")"
+  if [ -z "${list// /}" ]; then echo "没有有效编号（范围 1-${max}）"; sleep 1; return; fi
+  local newest; newest="$(index_list | head -1 | cut -f1)"
+  local -a ids=() names=() projs=() sizes=()
+  local n id rec file project size hit=0 total=0
+  for n in $list; do
+    id="$(snap_id_by_index "$n")"; [ -z "$id" ] && continue
+    rec="$(snapshot_record "$id")"
+    file="$(jq -r '.file' <<<"$rec")"
+    project="$(jq -r '.project' <<<"$rec")"
+    size="$(jq -r '.size' <<<"$rec")"
+    ids+=("$id"); names+=("$file"); projs+=("$project"); sizes+=("${size:-0}")
+    total=$((total + ${size:-0}))
+    [ "$id" = "$newest" ] && hit=1
+  done
+  if [ "${#ids[@]}" -eq 0 ]; then echo "没有可删除的快照"; sleep 1; return; fi
+  echo
+  echo "将删除 ${#ids[@]} 份快照，合计释放 $(human_size "$total")："
+  local k
+  for ((k=0; k<${#ids[@]}; k++)); do
+    printf '  %-22s %-48s %s\n' "${projs[$k]}" "${names[$k]}" "$(human_size "${sizes[$k]}")"
+  done
+  echo
+  if [ "$hit" = "1" ]; then
+    log WARN "其中包含「最新一份」快照（默认受保护）。"
+    printf '确实要连最新一份一起删？请输入 DELETE 确认（其他任意输入取消）：'
+    local w; read -r w || w=""
+    [ "$w" = "DELETE" ] || { echo "已取消"; sleep 1; return; }
+  else
+    ask_yes "确认删除这 ${#ids[@]} 份？" n || { echo "已取消"; return; }
+  fi
+  local ok=0 bad=0
+  for ((k=0; k<${#ids[@]}; k++)); do
+    if rm -f "$SNAP_DIR/${names[$k]}" "$SNAP_DIR/${names[$k]%.tar.*}.manifest.json" "$SNAP_DIR/${names[$k]}.sha256" && index_del "${ids[$k]}"; then
+      ok=$((ok + 1)); log OK "已删除快照 ${names[$k]}"
+    else
+      bad=$((bad + 1)); log WARN "删除失败：${names[$k]}"
+    fi
+  done
+  if [ "$bad" -gt 0 ]; then echo "完成：成功 $ok 份，失败 $bad 份"; else echo "完成：成功删除 $ok 份"; fi
+  printf '按回车继续…'; read -r _ || true
 }
 
 do_delete() {
